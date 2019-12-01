@@ -14,6 +14,9 @@ from collections import  namedtuple, deque
 from torch.utils.data import Dataset
 import torch
 
+from matplotlib import animation
+from IPython.display import display
+import matplotlib.pyplot as plt
 def animate_game(frames):
     
     """
@@ -40,8 +43,8 @@ class ReplayBufferTorch(torch.utils.data.Dataset):
         self.seed = seed
         self.device = device # possibility to put data on gpu for speedup
 
-        self.position = 0
-        self.cnt_push = 0
+        self.pos = 0
+        self.cur_size = 0
 
         self.data = {
             'obs' :         torch.zeros( (self.capacity,) +self.obs_dim).to(self.device),
@@ -52,24 +55,31 @@ class ReplayBufferTorch(torch.utils.data.Dataset):
         }
 
     def __len__(self):
-        return min(self.cnt_push, self.capacity)
+        return min(self.cur_size, self.capacity)
 
-    def push(self, data):
-        """Saves a transition dictionary with same dimensions as data (minus batch dim)."""
-        for key, val in self.data.items():
-            self.data[key][self.position,] = torch.tensor(data[key]).float().to(self.device)
-        
-        self.cnt_push +=1
-        self.position = (self.position + 1) % self.capacity
+    def push(self, ep_data):
+        """ Saves a episode of batch of users to the dataset """
+        with torch.no_grad():
+            bs = len(ep_data['obs'])
+            start = self.pos
+            end = (self.pos+bs)
+
+            # If at end of batch, clip first steps of episode:
+            if end >= self.capacity:
+                avail = self.capacity-start
+                for key, val in ep_data.items():
+                    ep_data[key] = ep_data[key][-avail]
+                end = self.capacity
+            
+            for key, val in self.data.items():
+                self.data[key][start:end,] = ep_data[key].float().to(self.device)
+            
+            
+            self.cur_size += bs
+            self.pos = (self.pos + bs) % self.capacity
+
     def __getitem__(self, idx):
         return {key : val[idx,] for key, val in self.data.items()}
-
-    #def sample_batch(self, batch_size):
-    #    idx = torch.randperm(min(self.cnt_push, self.capacity))[:batch_size]
-    #    batch = {key : val[idx,] for key, val in self.data.items()}
-    #    return batch
-
-
 
 #%% IMAGE TRANSFORM
 
