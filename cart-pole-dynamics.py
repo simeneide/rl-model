@@ -3,7 +3,9 @@ import gym
 import torch
 import torch.nn as nn
 import utils
-
+from pyro import poutine
+from pyro.poutine.util import prune_subsample_sites
+import warnings
 #%%
 obs_len = 4
 env_name = "CartPole-v1"
@@ -61,16 +63,6 @@ game.play_many_games()
 
 len(dl.dataset)
 #episode_data = game.play_game(render=True)
-#%%
-def state_cost(episode_data):
-    T = len(episode_data['obs'])
-    pos_cost = (episode_data['obs'][:,0]/2.4)**2
-    angle_cost = (episode_data['obs'][:,2]/0.15)**2
-    return pos_cost + angle_cost
-
-import matplotlib.pyplot as plt
-state_cost(dl.dataset.data).mean()
-plt.plot(state_cost(dl.dataset.data))
 
 #%%
 import torch.distributions.constraints as constraints
@@ -86,9 +78,9 @@ def set_noninform_prior(mod, scale = 1.0):
     for key, par in list(mod.named_parameters()):
         setattr(mod, key, PyroSample(dist.Normal(torch.zeros_like(par), scale*torch.ones_like(par)).independent() ))
 
-class Network(PyroModule):
+class StateTransition(PyroModule):
     def __init__(self, obs_dim, action_dim = (1,), seed = 1, device="cpu"):
-        super(Network, self).__init__()
+        super(StateTransition, self).__init__()
         self.num_data = 1000
         h_num = 3
         self.actionemb = PyroModule[nn.Embedding](3, h_num)
@@ -122,7 +114,7 @@ class Network(PyroModule):
     def init_opt(self):
         if self.guide is None:
             self.build_guide()
-        adam_params = {"lr": 0.001, "betas": (0.90, 0.999)}
+        adam_params = {"lr": 0.01, "betas": (0.90, 0.999)}
         optimizer = Adam(adam_params)
 
         self.svi = SVI(self.model, self.guide, optimizer, loss=Trace_ELBO())
@@ -136,76 +128,82 @@ class Network(PyroModule):
             loss = self.svi.step(batch)
             totloss+= loss
         return totloss/i
+
+    def sample_guide_trace(self, batch=None):
+        return poutine.trace(self.guide).get_trace(batch)
+
+    def predict(self, batch, guide_trace = None):
+        if guide_trace is None:
+            guide_trace = self.sample_guide_trace(batch)
+
+        model_trace = poutine.trace(poutine.replay(self.model, guide_trace)).get_trace(batch)
+        return model_trace.nodes['_RETURN']['value']
 #%%
 pyro.clear_param_store()
 pyro.enable_validation(True)
-system = Network(obs_dim = (4,))
-system.init_opt()
+world_model = StateTransition(obs_dim = (4,))
+world_model.init_opt()
 
-
-#%%
-batch = next(iter(dl))
-self = system
 #%% TRAIN DYNAMICS
-
 L = []
 for _ in range(100):
-    loss = system.train_epoch(dl)
+    loss = world_model.train_epoch(dl)
     L.append(loss)
 
 import matplotlib.pyplot as plt
 plt.plot(L)
 plt.yscale("log")
 plt.show()
-# %% QUANTILES OF PARAMETERS
-#for key, val in system.guide.quantiles([0.25,0.5,0.75]).items():
-#    for v in val:
-#        print(f"{key}: \t {v.detach().numpy()}")
 
-#%% Prediction
-predictive = Predictive(model=system.model, guide = system.guide, num_samples=50, return_sites=("_RETURN",))
-
-dl.dataset.data
-pred_samples = predictive(dl.dataset.data)['_RETURN'].detach()
-
-pred_samples.size()
-len(pred_samples)
-#%%
-import matplotlib.pyplot as plt
-for i in range(obs_len):
-    plt.plot(dl.dataset.data['obs_next'][:,i], color = "green")
-    for s in range(len(pred_samples)):
-        plt.plot((pred_samples[s,:,i]), alpha = 0.05)
-    plt.show()
 
 #%% PREDICT FROM START
-num_traces = 50
-ep_data = game.play_game(render=False)
-num_timesteps = len(ep_data['obs'])
-pred = predictive(ep_data)['_RETURN'].detach()
+with torch.no_grad():
+    num_traces = 50
+    ep_data = game.play_game(render=False)
+    num_timesteps = len(ep_data['obs'])
 
-pred_samples.size()
-num_timesteps
-# traces = [system.guide(None) for _ in range(num_traces)]
+    posterior_traces = [world_model.sample_guide_trace() for _ in range(num_traces)]
 
-pred_states = torch.zeros((num_traces, num_timesteps, obs_len))
-obs_states = torch.zeros((1, num_timesteps, obs_len))
+    pred_states = torch.zeros((num_traces, num_timesteps, obs_len))
+    obs_states = torch.zeros((1, num_timesteps, obs_len))
+
+    for s, trace in enumerate(posterior_traces):
+        for t in range(num_timesteps-1):
+            if (t == 0) | (t==100):
+                pred_states[s,t,:] = ep_data['obs'][t,].unsqueeze(0).float()
+            obs_states[0,t,:] = ep_data['obs'][t,].unsqueeze(0).float()
+
+            state_action = {
+                'obs' : pred_states[s,t,:].unsqueeze(0), 
+                'action' : ep_data['action'][t].unsqueeze(0), 
+                'obs_next' :None}
+
+            pred_states[s,t+1,:] = world_model.predict(state_action, trace).squeeze()
+
+    # PLOT TRAJECTORIES
+    for i in [0,2]:
+        plt.plot(obs_states[0,:,i], color = "green")
+        plt.plot(pred_states.detach()[:,:,i].mean(0), color = "red", alpha = 0.5)
+        for k in range(num_traces):
+            plt.plot(pred_states.detach()[k,:,i], alpha = 5/num_traces)
+        
+        
+        # plot size costmetics:
+        r = obs_states[0,:,i].max()-obs_states[0,:,i].min()
+        plt.ylim(obs_states[0,:,i].min()-r/2,obs_states[0,:,i].max()+r/2)
+        plt.show()
 
 
-for s in range(num_traces):
-    for t in range(num_timesteps-1):
-        if (t == 0) | (t==100):
-            pred_states[s,t,:] = ep_data['obs'][t,].unsqueeze(0).float()
-        obs_states[0,t,:] = ep_data['obs'][t,].unsqueeze(0).float()
-        pred_states[s,t+1,:] = pred_samples[s,t,:]
+#%% COST
+def state_cost(obs):
+    T = len(obs)
+    pos_cost = (obs[:,:,0]/2.4)**2
+    angle_cost = (obs[:,:,2]/0.15)**2
+    return pos_cost + angle_cost
 
-# PLOT TRAJECTORIES
-for i in range(obs_len):
-    plt.plot(obs_states[0,:,i], color = "green")
-    plt.plot(pred_states.detach()[:,:,i].mean(0), color = "red", alpha = 0.5)
-    for k in range(num_traces):
-        plt.plot(pred_states.detach()[k,:,i], alpha = 5/num_traces)
-    
-    plt.ylim(obs_states[0,:,i].min()*2,obs_states[0,:,i].max()*2)
-    plt.show()
-# %% LEARN STATE DYNAMICS
+pred_cost = state_cost(pred_states).t()
+true_cost = state_cost(obs_states).t()
+plt.plot(true_cost, color="green")
+_ = plt.plot(pred_cost, alpha = 0.1)
+_ = plt.plot(pred_cost.mean(1), color="red")
+plt.ylim( true_cost.min()-2, true_cost.max()+2)
